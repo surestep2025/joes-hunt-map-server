@@ -15,6 +15,8 @@ Render sets `PORT`. The process listens on `0.0.0.0` and that port.
 
 CORS allows the map at `https://surestep2025.github.io` (including `https://surestep2025.github.io/joes-hunt-map/`). Localhost is allowed for development.
 
+Joining a 12-character crew code creates that party if a restart wiped the database, so the same crew link keeps working. Positions still drop off after 24 hours.
+
 After the service is up, set the map's `config.json` next to `index.html`:
 
 ```json

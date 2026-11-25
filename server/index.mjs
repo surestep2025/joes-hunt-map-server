@@ -7,6 +7,7 @@ const DAY = 24 * 60 * 60 * 1000
 const TRAIL_MS = 6 * 60 * 60 * 1000
 const COLORS = ['#e2a84a', '#3d8bfd', '#3f9a68', '#d4654a', '#c084fc', '#8eb4c9']
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const STANDING_CODE = new RegExp(`^[${ALPHABET}]{12}$`)
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
 function partyCode() {
@@ -155,14 +156,27 @@ export function createPartyServer(dbPath = ':memory:') {
     }
     recent.push(now)
     joinsByIp.set(ip, recent)
-    const party = db.prepare('SELECT code FROM parties WHERE code = ?').get(code)
+    let party = db.prepare('SELECT code FROM parties WHERE code = ?').get(code)
     if (!party) {
-      const error = new Error('No party with that code.')
-      error.status = 404
-      throw error
+      if (!STANDING_CODE.test(code)) {
+        const error = new Error('No party with that code.')
+        error.status = 404
+        throw error
+      }
+      try {
+        db.prepare('INSERT INTO parties (code, created_at) VALUES (?, ?)').run(code, now)
+      } catch {
+        // Another phone created this crew at the same moment.
+      }
+      party = db.prepare('SELECT code FROM parties WHERE code = ?').get(code)
+      if (!party) {
+        const error = new Error('Could not open that crew. Try again.')
+        error.status = 500
+        throw error
+      }
     }
     const count = db.prepare('SELECT COUNT(*) AS n FROM members WHERE party = ?').get(code).n
-    if (count >= 8) {
+    if (count >= 16) {
       const error = new Error('That party is full.')
       error.status = 409
       throw error

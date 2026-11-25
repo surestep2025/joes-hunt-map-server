@@ -55,7 +55,15 @@ test('two phones share a party and old points expire', async () => {
     const blocked = await fetch(`${base}/health`, { headers: { Origin: 'https://example.com' } })
     assert.equal(blocked.headers.get('access-control-allow-origin'), null)
 
-    const missing = await fetch(`${base}/v1/parties/ZZZZZZZZZZZZ/join`, {
+    const revived = 'H7K2M9Q4W3NP'
+    const revivedJoin = await fetch(`${base}/v1/parties/${revived}/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Joe' }),
+    })
+    assert.equal(revivedJoin.status, 200)
+
+    const missing = await fetch(`${base}/v1/parties/11111111/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Nope' }),
