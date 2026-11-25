@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url'
 
 const DAY = 24 * 60 * 60 * 1000
 const TRAIL_MS = 6 * 60 * 60 * 1000
+const TRACK_KEEP = 4 * DAY
 const COLORS = ['#e2a84a', '#3d8bfd', '#3f9a68', '#d4654a', '#c084fc', '#8eb4c9']
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 const STANDING_CODE = new RegExp(`^[${ALPHABET}]{12}$`)
@@ -71,6 +72,15 @@ export function createPartyServer(dbPath = ':memory:') {
       at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS pings_member_at ON pings(member, at);
+    CREATE TABLE IF NOT EXISTS track_points (
+      member TEXT NOT NULL,
+      lat REAL NOT NULL,
+      lng REAL NOT NULL,
+      accuracy REAL,
+      at INTEGER NOT NULL,
+      PRIMARY KEY (member, at)
+    );
+    CREATE INDEX IF NOT EXISTS track_points_at ON track_points(at);
   `)
 
   /** @type {Map<string, Set<import('node:net').Socket>>} */
@@ -80,12 +90,16 @@ export function createPartyServer(dbPath = ':memory:') {
 
   function expire(now = Date.now()) {
     const cutoff = now - DAY
+    const trackCutoff = now - TRACK_KEEP
     db.prepare('DELETE FROM pings WHERE at < ?').run(cutoff)
+    db.prepare('DELETE FROM track_points WHERE at < ?').run(trackCutoff)
     db.prepare(
       `DELETE FROM members WHERE created_at < ? AND id NOT IN (
         SELECT member FROM pings WHERE at >= ?
+        UNION
+        SELECT member FROM track_points WHERE at >= ?
       )`,
-    ).run(cutoff, cutoff)
+    ).run(cutoff, cutoff, trackCutoff)
     db.prepare(
       `DELETE FROM parties WHERE created_at < ? AND code NOT IN (SELECT party FROM members)`,
     ).run(cutoff)
@@ -201,6 +215,7 @@ export function createPartyServer(dbPath = ':memory:') {
       throw error
     }
     let at = Number(body?.at)
+    if (Number.isFinite(at) && at > 1e14) at = Math.round(at / 1000)
     if (!Number.isFinite(at) || at > now + 2 * 60_000 || at < now - DAY) at = now
     const accuracy = finiteOrNull(body?.accuracy, 0, 100_000)
     const heading = finiteOrNull(body?.heading, 0, 360)
@@ -227,6 +242,42 @@ export function createPartyServer(dbPath = ':memory:') {
     return { ok: true }
   }
 
+  function addTrack(member, points, now = Date.now()) {
+    const insert = db.prepare(
+      'INSERT OR IGNORE INTO track_points (member, lat, lng, accuracy, at) VALUES (?, ?, ?, ?, ?)',
+    )
+    const list = Array.isArray(points) ? points.slice(0, 500) : []
+    let added = 0
+    for (const point of list) {
+      const lat = Number(point?.lat)
+      const lng = Number(point?.lng)
+      const atRaw = Number(point?.at)
+      const at = Number.isFinite(atRaw) && atRaw > 1e14 ? Math.round(atRaw / 1000) : atRaw
+      if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) continue
+      if (!Number.isFinite(at) || at > now + 2 * 60_000 || at < now - TRACK_KEEP) continue
+      const accuracy = finiteOrNull(point?.accuracy, 0, 100_000)
+      if (accuracy != null && accuracy > 50) continue
+      const result = insert.run(member.id, lat, lng, accuracy, Math.round(at))
+      if (result.changes) added += 1
+    }
+    return { ok: true, added }
+  }
+
+  function tracksFor(code, now = Date.now()) {
+    const members = db.prepare('SELECT id, name, color FROM members WHERE party = ? ORDER BY created_at ASC').all(code)
+    return {
+      serverTime: now,
+      tracks: members.map((member) => ({
+        id: member.id,
+        name: member.name,
+        color: member.color,
+        points: db
+          .prepare('SELECT lat, lng, at FROM track_points WHERE member = ? AND at >= ? ORDER BY at ASC')
+          .all(member.id, now - TRACK_KEEP),
+      })),
+    }
+  }
+
   function leave(member) {
     db.prepare('DELETE FROM pings WHERE member = ?').run(member.id)
     db.prepare('DELETE FROM members WHERE id = ?').run(member.id)
@@ -244,7 +295,7 @@ export function createPartyServer(dbPath = ':memory:') {
     if (req.method === 'OPTIONS') return send(req, res, 204, null)
     if (req.method === 'GET' && url.pathname === '/health') return send(req, res, 200, { ok: true })
 
-    const partyMatch = url.pathname.match(/^\/v1\/parties\/([A-Z0-9]{8,16})(?:\/(join|ping|leave))?$/)
+    const partyMatch = url.pathname.match(/^\/v1\/parties\/([A-Z0-9]{8,16})(?:\/(tracks|track|join|ping|leave))?$/)
     if (req.method === 'POST' && url.pathname === '/v1/parties') {
       return readJson(req)
         .then(() => send(req, res, 200, createParty()))
@@ -261,6 +312,12 @@ export function createPartyServer(dbPath = ':memory:') {
         .catch((error) => send(req, res, error.status || 500, { error: error.message || 'Server error' }))
     }
     if (!auth || auth.party !== code) return send(req, res, 401, { error: 'Join the party again.' })
+    if (req.method === 'GET' && action === 'tracks') return send(req, res, 200, tracksFor(code))
+    if (req.method === 'POST' && action === 'track') {
+      return readJson(req)
+        .then((body) => send(req, res, 200, addTrack(auth, body?.points)))
+        .catch((error) => send(req, res, error.status || 500, { error: error.message || 'Server error' }))
+    }
     if (req.method === 'GET' && !action) return send(req, res, 200, snapshot(code, auth.id))
     if (req.method === 'POST' && action === 'ping') {
       return readJson(req)

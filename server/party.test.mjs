@@ -70,11 +70,41 @@ test('two phones share a party and old points expire', async () => {
     })
     assert.equal(missing.status, 404)
 
+    const trackAt = Date.now() - 2 * 24 * 60 * 60 * 1000
+    const uploaded = await fetch(`${base}/v1/parties/${created.code}/track`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jojo.token}` },
+      body: JSON.stringify({
+        points: [
+          { lat: 43.89, lng: -90.17, accuracy: 8, at: trackAt },
+          { lat: 43.891, lng: -90.17, accuracy: 80, at: trackAt + 1000 },
+          { lat: 43.892, lng: -90.17, accuracy: 8, at: trackAt },
+        ],
+      }),
+    })
+    assert.equal(uploaded.status, 200)
+    const tracks = await fetch(`${base}/v1/parties/${created.code}/tracks`, {
+      headers: { Authorization: `Bearer ${joe.token}` },
+    }).then((res) => res.json())
+    const jojoTrack = tracks.tracks.find((track) => track.name === 'Jojo')
+    assert.equal(jojoTrack.points.length, 1)
+    assert.equal(jojoTrack.points[0].at, trackAt)
+
     app.expire(Date.now() + 25 * 60 * 60 * 1000)
     const gone = await fetch(`${base}/v1/parties/${created.code}`, {
       headers: { Authorization: `Bearer ${joe.token}` },
     })
     assert.equal(gone.status, 401)
+    const kept = await fetch(`${base}/v1/parties/${created.code}/tracks`, {
+      headers: { Authorization: `Bearer ${jojo.token}` },
+    }).then((res) => res.json())
+    assert.equal(kept.tracks.find((track) => track.name === 'Jojo').points.length, 1)
+
+    app.expire(Date.now() + 5 * 24 * 60 * 60 * 1000)
+    const dropped = await fetch(`${base}/v1/parties/${created.code}/tracks`, {
+      headers: { Authorization: `Bearer ${jojo.token}` },
+    })
+    assert.equal(dropped.status, 401)
   } finally {
     app.close()
   }
