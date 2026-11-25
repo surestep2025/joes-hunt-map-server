@@ -160,16 +160,8 @@ export function createPartyServer(dbPath = ':memory:') {
     throw error
   }
 
-  function join(code, rawName, ip, now = Date.now()) {
-    expire(now)
-    const recent = (joinsByIp.get(ip) ?? []).filter((time) => now - time < 60_000)
-    if (recent.length >= 20) {
-      const error = new Error('Too many joins. Wait a minute.')
-      error.status = 429
-      throw error
-    }
-    recent.push(now)
-    joinsByIp.set(ip, recent)
+
+  function ensureParty(code, now = Date.now()) {
     let party = db.prepare('SELECT code FROM parties WHERE code = ?').get(code)
     if (!party) {
       if (!STANDING_CODE.test(code)) {
@@ -189,6 +181,155 @@ export function createPartyServer(dbPath = ':memory:') {
         throw error
       }
     }
+    return party
+  }
+
+  function validToken(value) {
+    return typeof value === 'string' && value.length >= 20 && value.length <= 200 && !/\s/.test(value)
+  }
+
+  function validId(value) {
+    return typeof value === 'string' && /^[A-Za-z0-9_-]{8,32}$/.test(value)
+  }
+
+  function pickColor(code, requested) {
+    if (typeof requested === 'string' && /^#[0-9A-Fa-f]{6}$/.test(requested)) return requested
+    const count = db.prepare('SELECT COUNT(*) AS n FROM members WHERE party = ?').get(code).n
+    return COLORS[count % COLORS.length]
+  }
+
+  function restoreMember(code, rawName, opts = {}, now = Date.now()) {
+    const token = validToken(opts.token) ? opts.token.trim() : ''
+    if (!token) return null
+    ensureParty(code, now)
+    const name = cleanName(rawName)
+    const existing = memberByToken(token)
+    if (existing) {
+      if (existing.party !== code) return null
+      if (existing.name !== name) db.prepare('UPDATE members SET name = ? WHERE id = ?').run(name, existing.id)
+      return { memberId: existing.id, token: existing.token, name, color: existing.color, code }
+    }
+    const count = db.prepare('SELECT COUNT(*) AS n FROM members WHERE party = ?').get(code).n
+    if (count >= 16) {
+      const error = new Error('That party is full.')
+      error.status = 409
+      throw error
+    }
+    let id = validId(opts.memberId) ? opts.memberId : randomBytes(9).toString('base64url')
+    if (db.prepare('SELECT id FROM members WHERE id = ?').get(id)) id = randomBytes(9).toString('base64url')
+    const color = pickColor(code, opts.color)
+    db.prepare(
+      'INSERT INTO members (id, party, name, token, color, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(id, code, name, token, color, now)
+    broadcast(code)
+    return { memberId: id, token, name, color, code }
+  }
+
+  function headerValue(req, name) {
+    const value = req.headers[name]
+    return Array.isArray(value) ? value[0] : value || ''
+  }
+
+  function basicParts(req) {
+    const header = headerValue(req, 'authorization')
+    if (!header.startsWith('Basic ')) return { user: '', password: '' }
+    try {
+      const decoded = Buffer.from(header.slice(6).trim(), 'base64').toString('utf8')
+      const cut = decoded.indexOf(':')
+      if (cut < 0) return { user: decoded, password: '' }
+      return { user: decoded.slice(0, cut), password: decoded.slice(cut + 1) }
+    } catch {
+      return { user: '', password: '' }
+    }
+  }
+
+  function resumeFromRequest(req, url, code, now = Date.now()) {
+    const basic = basicParts(req)
+    const token = bearer(req) || basic.password || url.searchParams.get('token') || ''
+    const existing = memberByToken(token)
+    if (existing && existing.party === code) return existing
+    const name = headerValue(req, 'x-hunt-name') || url.searchParams.get('name') || basic.user || ''
+    if (!name || !validToken(token)) return undefined
+    try {
+      const restored = restoreMember(
+        code,
+        name,
+        {
+          token,
+          memberId: headerValue(req, 'x-hunt-member') || url.searchParams.get('member') || '',
+          color: headerValue(req, 'x-hunt-color') || url.searchParams.get('color') || '',
+        },
+        now,
+      )
+      return restored ? memberByToken(restored.token) : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  function locationFromOwnTracks(item, now = Date.now()) {
+    if (!item || typeof item !== 'object') return null
+    if (item.type === 'Feature' && item.geometry?.coordinates) {
+      const [lng, lat] = item.geometry.coordinates
+      const props = item.properties || {}
+      let at = Number(Date.parse(props.timestamp) || props.timestamp || now)
+      if (Number.isFinite(at) && at < 1e12) at = Math.round(at * 1000)
+      return {
+        lat: Number(lat),
+        lng: Number(lng),
+        accuracy: props.horizontal_accuracy ?? props.accuracy ?? props.acc,
+        heading: props.course ?? props.heading,
+        battery: props.battery_level != null ? Number(props.battery_level) * (Number(props.battery_level) <= 1 ? 100 : 1) : props.battery,
+        at,
+      }
+    }
+    if (item._type && item._type !== 'location') return null
+    const lat = Number(item.lat ?? item.latitude)
+    const lng = Number(item.lon ?? item.lng ?? item.longitude)
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null
+    let at = Number(item.tst ?? item.at ?? item.timestamp ?? now)
+    if (Number.isFinite(at) && at < 1e12) at = Math.round(at * 1000)
+    return {
+      lat,
+      lng,
+      accuracy: item.acc ?? item.accuracy,
+      heading: item.cog ?? item.heading,
+      battery: item.batt ?? item.battery,
+      at,
+    }
+  }
+
+  function ingestLocations(auth, body, now = Date.now()) {
+    let items = []
+    if (Array.isArray(body)) items = body
+    else if (body?.type === 'FeatureCollection' && Array.isArray(body.features)) items = body.features
+    else if (body && typeof body === 'object') items = [body]
+    let accepted = 0
+    for (const item of items) {
+      const loc = locationFromOwnTracks(item, now)
+      if (!loc || !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng)) continue
+      recordPing(auth, loc, now)
+      addTrack(auth, [{ lat: loc.lat, lng: loc.lng, accuracy: loc.accuracy, at: loc.at }], now)
+      accepted += 1
+    }
+    return accepted
+  }
+
+  function join(code, rawName, ip, now = Date.now(), opts = {}) {
+    expire(now)
+    const recent = (joinsByIp.get(ip) ?? []).filter((time) => now - time < 60_000)
+    if (recent.length >= 20) {
+      const error = new Error('Too many joins. Wait a minute.')
+      error.status = 429
+      throw error
+    }
+    recent.push(now)
+    joinsByIp.set(ip, recent)
+    if (opts.token) {
+      const restored = restoreMember(code, rawName, opts, now)
+      if (restored) return restored
+    }
+    ensureParty(code, now)
     const count = db.prepare('SELECT COUNT(*) AS n FROM members WHERE party = ?').get(code).n
     if (count >= 16) {
       const error = new Error('That party is full.')
@@ -295,7 +436,7 @@ export function createPartyServer(dbPath = ':memory:') {
     if (req.method === 'OPTIONS') return send(req, res, 204, null)
     if (req.method === 'GET' && url.pathname === '/health') return send(req, res, 200, { ok: true })
 
-    const partyMatch = url.pathname.match(/^\/v1\/parties\/([A-Z0-9]{8,16})(?:\/(tracks|track|join|ping|leave))?$/)
+    const partyMatch = url.pathname.match(/^\/v1\/parties\/([A-Z0-9]{8,16})(?:\/(tracks|track|join|ping|leave|owntracks))?$/)
     if (req.method === 'POST' && url.pathname === '/v1/parties') {
       return readJson(req)
         .then(() => send(req, res, 200, createParty()))
@@ -304,11 +445,22 @@ export function createPartyServer(dbPath = ':memory:') {
     if (!partyMatch) return send(req, res, 404, { error: 'Not found' })
     const code = partyMatch[1]
     const action = partyMatch[2] || ''
-    const auth = memberByToken(bearer(req) || url.searchParams.get('token') || '')
+    const auth = resumeFromRequest(req, url, code)
 
     if (req.method === 'POST' && action === 'join') {
       return readJson(req)
-        .then((body) => send(req, res, 200, join(code, body?.name, req.socket.remoteAddress || 'unknown')))
+        .then((body) =>
+          send(
+            req,
+            res,
+            200,
+            join(code, body?.name, req.socket.remoteAddress || 'unknown', Date.now(), {
+              token: body?.token,
+              memberId: body?.memberId,
+              color: body?.color,
+            }),
+          ),
+        )
         .catch((error) => send(req, res, error.status || 500, { error: error.message || 'Server error' }))
     }
     if (!auth || auth.party !== code) return send(req, res, 401, { error: 'Join the party again.' })
@@ -322,6 +474,14 @@ export function createPartyServer(dbPath = ':memory:') {
     if (req.method === 'POST' && action === 'ping') {
       return readJson(req)
         .then((body) => send(req, res, 200, recordPing(auth, body)))
+        .catch((error) => send(req, res, error.status || 500, { error: error.message || 'Server error' }))
+    }
+    if (req.method === 'POST' && action === 'owntracks') {
+      return readJson(req)
+        .then((body) => {
+          ingestLocations(auth, body)
+          send(req, res, 200, [])
+        })
         .catch((error) => send(req, res, error.status || 500, { error: error.message || 'Server error' }))
     }
     if (req.method === 'POST' && action === 'leave') return send(req, res, 200, leave(auth))
@@ -346,7 +506,7 @@ export function createPartyServer(dbPath = ':memory:') {
       return
     }
     const code = (url.searchParams.get('party') || '').toUpperCase()
-    const auth = memberByToken(url.searchParams.get('token') || '')
+    const auth = resumeFromRequest(req, url, code)
     const key = req.headers['sec-websocket-key']
     if (req.headers.origin && !allowOrigin(req.headers.origin)) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
@@ -441,7 +601,7 @@ function send(req, res, status, body) {
   const payload = body == null ? '' : JSON.stringify(body)
   const headers = {
     'Content-Type': body == null ? 'text/plain' : 'application/json; charset=utf-8',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Hunt-Name, X-Hunt-Member, X-Hunt-Color',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     Vary: 'Origin',
     'Cache-Control': 'no-store',
